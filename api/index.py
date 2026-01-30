@@ -8,7 +8,7 @@ import os
 
 app = FastAPI()
 
-# Configure CORS
+# Configure CORS - Allow all for maximum compatibility
 origins = ["*"]
 
 app.add_middleware(
@@ -21,31 +21,39 @@ app.add_middleware(
 
 @app.get("/api")
 async def health_check():
-    return {"status": "ok", "message": "Umii Video Downloader Backend is Running"}
+    return {"status": "ok", "message": "Umii Video Downloader Backend is Online"}
 
 def get_video_info(url: str):
-    # Vercel file system is read-only, use /tmp for cache
-    # We add User-Agent headers to look like a real browser (Chrome on Windows)
+    # Optimizations for Vercel (Speed & Stealth)
     ydl_opts = {
-        'quiet': True,
-        'no_warnings': True,
-        'format': 'best',
+        'format': 'best', # 'best' is faster than specific video+audio merge
         'outtmpl': '%(title)s.%(ext)s',
         'cache_dir': '/tmp/yt-dlp-cache',
         'noplaylist': True,
+        'quiet': True,
+        'no_warnings': True,
+        # Restrict info to speed up processing
+        'skip_download': True,
+        # Stealth headers to mimic a real desktop user
         'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.9',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'Sec-Fetch-Mode': 'navigate',
         }
     }
     
+    # Specific adjustments for TikTok to avoid 403s/Captchas
+    if "tiktok.com" in url:
+        # Sometimes forcing the mobile API via user agent works better, 
+        # but modern TikTok often prefers desktop emulation for public links.
+        pass
+
     try:
-        # Create cache dir if it doesn't exist
         os.makedirs('/tmp/yt-dlp-cache', exist_ok=True)
         
         with YoutubeDL(ydl_opts) as ydl:
-            # extract_info with download=False fetches metadata
+            # download=False is crucial for speed
             info = ydl.extract_info(url, download=False)
             
             return {
@@ -58,26 +66,35 @@ def get_video_info(url: str):
                 "ext": info.get('ext', 'mp4')
             }
     except Exception as e:
-        print(f"Error extracting info: {str(e)}")
-        # We return None here to let the API handler raise the specific HTTP exception
-        return None
+        error_str = str(e)
+        print(f"Extraction Error: {error_str}")
+        # Return the specific error so the frontend displays it
+        return {"error": error_str}
 
 @app.get("/api/info")
 async def info(url: str = Query(..., description="The URL of the video to process")):
     if not url:
         raise HTTPException(status_code=400, detail="URL is required")
     
-    try:
-        data = get_video_info(url)
-        if not data:
-            # If data is None, it means yt-dlp failed (likely blocking or invalid URL)
-            return JSONResponse(
-                status_code=400, 
-                content={"detail": "Could not extract video. The link might be private, or the platform blocked the request."}
-            )
-        return data
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"detail": f"Server Error: {str(e)}"})
+    result = get_video_info(url)
+    
+    # Check if yt-dlp returned a dictionary with an error key
+    if result and "error" in result:
+        # If it's a 403 or specific blocking message, pass it through
+        error_msg = result["error"]
+        if "HTTP Error 403" in error_msg:
+            return JSONResponse(status_code=403, content={"detail": "Access Denied by Platform. Try a different link or try again later."})
+        if "Sign in to confirm" in error_msg:
+             return JSONResponse(status_code=403, content={"detail": "This video requires login (Private/Age-gated)."})
+        return JSONResponse(status_code=400, content={"detail": f"Extraction Failed: {error_msg}"})
+        
+    if not result:
+        return JSONResponse(
+            status_code=400, 
+            content={"detail": "Could not extract video. Link might be invalid or the server timed out."}
+        )
+    
+    return result
 
 @app.get("/api/download")
 async def download(
@@ -86,9 +103,8 @@ async def download(
     ext: str = Query("mp4", description="File extension")
 ):
     try:
-        # Request headers to avoid 403 Forbidden on the video file itself
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36'
         }
         
         r = requests.get(url, stream=True, headers=headers)
@@ -104,4 +120,4 @@ async def download(
             }
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Download failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Download Proxy Failed: {str(e)}")
